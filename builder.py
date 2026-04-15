@@ -1,7 +1,6 @@
 import json
 import requests
 import time
-import os
 from neo4j import GraphDatabase
 from tqdm import tqdm
 
@@ -17,15 +16,6 @@ NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = "neo4jdesktop2"  
 
 INPUT_FILE = "trials.json"
-REQUEST_TIMEOUT_SECONDS = 60
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 1.5
-
-OLLAMA_URL = os.getenv("OLLAMA_URL", OLLAMA_URL)
-MODEL_NAME = os.getenv("MODEL_NAME", MODEL_NAME)
-NEO4J_URI = os.getenv("NEO4J_URI", NEO4J_URI)
-NEO4J_USER = os.getenv("NEO4J_USER", NEO4J_USER)
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", NEO4J_PASSWORD)
 
 # ==============================
 # ONTOLOGY
@@ -83,35 +73,20 @@ Text:
 \"\"\"
 """
 
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": MODEL_NAME,
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as e:
-        print("❌ LLM request failed:", e)
-        return None
-    except ValueError as e:
-        print("❌ Invalid JSON response from LLM endpoint:", e)
-        return None
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": MODEL_NAME,
+            "prompt": prompt,
+            "stream": False
+        }
+    )
 
-    output = payload.get("response")
-    if not isinstance(output, str):
-        print("❌ Missing or invalid `response` field in LLM payload.")
-        return None
+    output = response.json()["response"]
 
-    # Try parsing model output JSON safely
+    # Try parsing JSON safely
     try:
         json_start = output.find("{")
-        if json_start == -1:
-            raise ValueError("No JSON object found in model output.")
         json_data = json.loads(output[json_start:])
         return json_data
     except Exception as e:
@@ -123,49 +98,19 @@ Text:
 # ==============================
 
 def validate_extraction(data):
-    if not isinstance(data, dict):
+    if not data:
         return None
 
     valid_entities = []
     valid_relations = []
-    known_entity_names = set()
 
     for ent in data.get("entities", []):
-        if not isinstance(ent, dict):
-            continue
-        name = ent.get("name")
-        ent_type = ent.get("type")
-        if (
-            isinstance(name, str)
-            and name.strip()
-            and ent_type in ALLOWED_ENTITY_TYPES
-        ):
-            cleaned = {"name": name.strip(), "type": ent_type}
-            valid_entities.append(cleaned)
-            known_entity_names.add(cleaned["name"])
+        if ent["type"] in ALLOWED_ENTITY_TYPES:
+            valid_entities.append(ent)
 
     for rel in data.get("relations", []):
-        if not isinstance(rel, dict):
-            continue
-        source = rel.get("source")
-        relation = rel.get("relation")
-        target = rel.get("target")
-        if (
-            isinstance(source, str)
-            and source.strip()
-            and isinstance(target, str)
-            and target.strip()
-            and relation in ALLOWED_RELATIONS
-            and source.strip() in known_entity_names
-            and target.strip() in known_entity_names
-        ):
-            valid_relations.append(
-                {
-                    "source": source.strip(),
-                    "relation": relation,
-                    "target": target.strip(),
-                }
-            )
+        if rel["relation"] in ALLOWED_RELATIONS:
+            valid_relations.append(rel)
 
     return {
         "entities": valid_entities,
@@ -183,8 +128,6 @@ class KnowledgeGraph:
             NEO4J_URI,
             auth=(NEO4J_USER, NEO4J_PASSWORD)
         )
-        # Fail fast if the DB is unreachable.
-        self.driver.verify_connectivity()
 
     def close(self):
         self.driver.close()
@@ -226,75 +169,30 @@ class KnowledgeGraph:
 # ==============================
 
 def main():
-    input_file = os.getenv("INPUT_FILE", INPUT_FILE)
 
-    try:
-        with open(input_file, "r", encoding="utf-8") as f:
-            trials = json.load(f)
-    except FileNotFoundError:
-        print(f"❌ Input file not found: {input_file}")
-        return
-    except json.JSONDecodeError as e:
-        print(f"❌ Failed to parse JSON from {input_file}: {e}")
-        return
+    with open(INPUT_FILE, "r") as f:
+        trials = json.load(f)
 
-    if not isinstance(trials, list):
-        print("❌ Expected input JSON to be a list of trial objects.")
-        return
+    kg = KnowledgeGraph()
 
-    try:
-        kg = KnowledgeGraph()
-    except Exception as e:
-        print(f"❌ Failed to initialize Neo4j connection: {e}")
-        return
+    for trial in tqdm(trials):
 
-    inserted_count = 0
-    skipped_count = 0
+        trial_id = trial["nct_id"]
+        combined_text = trial["title"] + "\n" + trial["description"]
 
-    try:
-        for trial in tqdm(trials):
-            if not isinstance(trial, dict):
-                skipped_count += 1
-                continue
+        for attempt in range(3):
+            extracted = extract_with_llm(combined_text)
+            validated = validate_extraction(extracted)
 
-            trial_id = trial.get("nct_id")
-            title = trial.get("title", "")
-            description = trial.get("description", "")
+            if validated:
+                kg.insert_data(trial_id, validated)
+                break
+            else:
+                print(f"Retrying trial {trial_id}")
+                time.sleep(1)
 
-            if not trial_id or (not title and not description):
-                skipped_count += 1
-                continue
-
-            combined_text = f"{title}\n{description}".strip()
-            validated = None
-
-            for attempt in range(MAX_RETRIES):
-                extracted = extract_with_llm(combined_text)
-                validated = validate_extraction(extracted)
-
-                if validated and validated["entities"]:
-                    try:
-                        kg.insert_data(trial_id, validated)
-                        inserted_count += 1
-                        break
-                    except Exception as e:
-                        print(f"❌ Neo4j insert failed for trial {trial_id}: {e}")
-                else:
-                    print(f"Retrying trial {trial_id}")
-
-                # Backoff between retries.
-                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
-                time.sleep(sleep_seconds)
-
-            if not validated:
-                skipped_count += 1
-    finally:
-        kg.close()
-
-    print(
-        f"✅ Knowledge graph construction complete. "
-        f"Inserted: {inserted_count}, Skipped: {skipped_count}"
-    )
+    kg.close()
+    print("✅ Knowledge graph construction complete.")
 
 
 if __name__ == "__main__":
